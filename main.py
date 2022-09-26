@@ -1,6 +1,9 @@
+"""
+This code is used to merge a set of LDR panoramas into a single HDR panorama,
+then correct the clipped intensity of the sun in the panorama using an image
+captured with a ND filter.
+"""
 import os
-
-os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
 from typing import Dict, Tuple
 
 import colour_demosaicing
@@ -10,7 +13,7 @@ import exifread
 import rawpy
 from scipy import io
 import glob
-from tqdm.auto import tqdm, trange
+from tqdm.auto import tqdm
 import json
 import tifffile
 from skimage import restoration
@@ -68,7 +71,7 @@ def read_exposure_from_raw(raw_file: str) -> Dict[str, float]:
           "shutter speed": 0.01,
           "aperture": 2.8,}
     """
-    with open(raw_file, "rb") as f:
+    with open(raw_file, "rb") as f:  # pylint: disable=redefined-outer-name
         exif = exifread.process_file(f, details=False)
         exposure = {
             "ISO": float(exif["EXIF ISOSpeedRatings"].values[0]),
@@ -99,10 +102,8 @@ def relative_exposure_amount(exposure: Dict[str, float]) -> float:
     return input_exposure_amount / base_exposure_amount
 
 
-def calibrate_ccm_ricoh2sony(
-        sony_raw_file: str,
-        ricoh_raw_file: str,
-) -> Tuple[np.ndarray, float]:
+def calibrate_ccm_ricoh2sony(sony_file: str, ricoh_file: str) \
+        -> Tuple[np.ndarray, float]:
     """Calibrate the color correction matrix from Ricoh to Sony.
 
     Calibrate the color correction matrix from Ricoh to Sony by reading the
@@ -123,8 +124,8 @@ def calibrate_ccm_ricoh2sony(
     ``over_exposure``.
 
     Args:
-        sony_raw_file (str): path to the raw image file captured by Sony camera.
-        ricoh_raw_file (str): path to the raw image file captured by Ricoh
+        sony_file (str): path to the raw image file captured by Sony camera.
+        ricoh_file (str): path to the raw image file captured by Ricoh
             camera.
 
     Returns:
@@ -134,17 +135,17 @@ def calibrate_ccm_ricoh2sony(
     ricoh2sony_ccm_file = os.path.join(CALIB_DATA_DIR, "ricoh2sony_ccm.mat")
     if os.path.exists(ricoh2sony_ccm_file):
         print(f"Loading Ricoh2Sony CCM from {ricoh2sony_ccm_file}...")
-        return io.loadmat(ricoh2sony_ccm_file)["ccm"], \
-               io.loadmat(ricoh2sony_ccm_file)["over_exposure"].item()
+        return (io.loadmat(ricoh2sony_ccm_file)["ccm"],
+                io.loadmat(ricoh2sony_ccm_file)["over_exposure"].item())
     else:
         # Read .ARW file captured by Sony camera
         sony_rel_exposure, sony_colors = \
-            read_color_checker_from_raw(sony_raw_file)
+            read_color_checker_from_raw(sony_file)
         # Read .DNG file captured by Ricoh camera
         ricoh_rel_exposure, ricoh_colors = \
-            read_color_checker_from_raw(ricoh_raw_file)
+            read_color_checker_from_raw(ricoh_file)
         # Compute CCM
-        ricoh2sony_ccm, residual, _, _ = \
+        ricoh2sony_ccm, _, _, _ = \
             np.linalg.lstsq(ricoh_colors, sony_colors)
         # Consider in the effect of exposure
         ricoh2sony_ccm = ricoh2sony_ccm * ricoh_rel_exposure / sony_rel_exposure
@@ -184,8 +185,8 @@ def calibrate_ndfilter(
     nd_filter_file = os.path.join(CALIB_DATA_DIR, "nd_filter.mat")
     if os.path.exists(nd_filter_file):
         print(f"Loading ND filter density and CCM from {nd_filter_file}...")
-        return io.loadmat(nd_filter_file)["density"].item(), \
-               io.loadmat(nd_filter_file)["ccm"],
+        return (io.loadmat(nd_filter_file)["density"].item(),
+                io.loadmat(nd_filter_file)["ccm"])
     else:
         # Read .ARW file captured with ND filter
         w_filter_rel_exposure, w_filter_colors = \
@@ -369,7 +370,7 @@ def preprocess_envmap_group(envmap_dir, ccm, over_exposure):
         tifffile.imsave(envmap_tiff_file, to_uint16(envmap_linsrgb))
     exposure_infos["over_exposure_coeff"] = over_exposure
     # save exposure information
-    with open(exposure_info_file, "w", encoding="utf-8") as f:
+    with open(exposure_info_file, "w", encoding="utf-8") as f: # pylint: disable=redefined-outer-name
         json.dump(exposure_infos, f, ensure_ascii=False, indent=4)
 
 
@@ -451,7 +452,7 @@ def merge_ldrs_into_hdr(envmap_dir: str) -> np.ndarray:
     # Read list of envmap files and exposure infos
     envmap_files = glob.glob(os.path.join(envmap_dir, "*_er.tif"))
     with open(os.path.join(envmap_dir, EXPOSURE_INFO_FILENAME),
-              "r", encoding="utf-8") as f:
+              "r", encoding="utf-8") as f:  # pylint: disable=redefined-outer-name
         exposure_infos = json.load(f)
 
     # height, width = 3648, 7296
@@ -519,11 +520,12 @@ class SolidAngleCalculator:
     def __init__(self):
         pass
 
-    def get_solid_angle(self, param, param1):
+    def get_solid_angle(self, x, y):
         pass
 
 
 class SolidAngleCalculatorForLimitedFOVImage(SolidAngleCalculator):
+    """Calculate solid angle for a limited FOV image."""
     def __init__(self,
                  pixel_w: int, pixel_h: int,
                  sensor_w: float, sensor_h: float,
@@ -568,6 +570,7 @@ class SolidAngleCalculatorForLimitedFOVImage(SolidAngleCalculator):
 
 
 class SolidAngleCalculatorForPanorama(SolidAngleCalculator):
+    """Calculate solid angle for a panorama image."""
     def __init__(self, pixel_w: int, pixel_h: int):
         """Initialize the solid angle calculator.
 
@@ -741,7 +744,8 @@ if __name__ == "__main__":
     print(f"Sun intensity: {sun_intensity}")
 
     # # compare to other environment map containing a sun
-    # other_envmap_path = r"D:\Datasets\laval_face2light\faceLightProbeDataset" \
+    # other_envmap_path = r"D:\Datasets\laval_face2light" \
+    #                     r"\faceLightProbeDataset" \
     #                     r"\20170921-dir1-AG8A8823-envmap.exr"
     # other_envmap = read_image(other_envmap_path)
     # other_envmap_brightness = get_brightness_image(other_envmap)
@@ -782,7 +786,8 @@ if __name__ == "__main__":
     print(f"Mean intensity to be added to the envmap: {mean_intensity}")
     envmap_hdr_sun = envmap_hdr + \
                      mean_intensity.reshape(1, 1, 3) * \
-                     envmap_bright_mask.reshape(envmap_hdr.shape[0], envmap_hdr.shape[1], 1)
+                     envmap_bright_mask.reshape(
+                         envmap_hdr.shape[0], envmap_hdr.shape[1], 1)
     write_image(os.path.join(group_path, "envmap", "envmap_with_sun.hdr"),
                              envmap_hdr_sun)
     print("===== Step 6: Done =====\n")
