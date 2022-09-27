@@ -3,23 +3,23 @@ This code is used to merge a set of LDR panoramas into a single HDR panorama,
 then correct the clipped intensity of the sun in the panorama using an image
 captured with a ND filter.
 """
+import glob
+import json
 import os
 from typing import Dict, Tuple
 
 import colour_demosaicing
-import numpy as np
 import cv2
 import exifread
+import numpy as np
 import rawpy
-from scipy import io
-import glob
-from tqdm.auto import tqdm
-import json
 import tifffile
+from scipy import io
 from skimage import restoration
+from tqdm.auto import tqdm
 
-from general_utils import read_image, write_image, extract_filename, to_uint16, \
-    to_float32
+from utils import extract_filename, read_image, to_float32, to_uint16, \
+    write_image
 
 DATA_DIR = os.path.abspath("./Data")
 CALIB_DATA_DIR = os.path.join(DATA_DIR, "for_calibration")
@@ -742,18 +742,6 @@ if __name__ == "__main__":
                                     sun_brt_img.shape)
     sun_intensity = sun_image[sun_position[0], sun_position[1], :]
     print(f"Sun intensity: {sun_intensity}")
-
-    # # compare to other environment map containing a sun
-    # other_envmap_path = r"D:\Datasets\laval_face2light" \
-    #                     r"\faceLightProbeDataset" \
-    #                     r"\20170921-dir1-AG8A8823-envmap.exr"
-    # other_envmap = read_image(other_envmap_path)
-    # other_envmap_brightness = get_brightness_image(other_envmap)
-    # # print min, max and average
-    # print(f"Laval envmap range: "
-    #       f"min = {np.min(other_envmap_brightness)}, "
-    #       f"max = {np.max(other_envmap_brightness)}, "
-    #       f"average = {np.mean(other_envmap_brightness)}")
 
     print("===== Step 5: Done =====\n")
 
