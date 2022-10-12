@@ -6,7 +6,7 @@ captured with a ND filter.
 import glob
 import json
 import os
-from typing import Dict, Tuple
+from typing import Tuple
 
 import colour_demosaicing
 import cv2
@@ -18,88 +18,23 @@ from scipy import io
 from skimage import restoration
 from tqdm.auto import tqdm
 
-from utils import extract_filename, read_image, to_float32, to_uint16, \
-    write_image
+from check_envmap import check_bright_part_of_hdr_image
+from raw_process import camera_isp, SONY_CAM2XYZ_MAT, subtract_black_level
+from relative_exposure import read_exposure_from_raw, relative_exposure_amount
+from solid_angle import SolidAngleCalculatorForLimitedFOVImage, \
+    SolidAngleCalculatorForPanorama
+from utils import extract_filename, get_brightness_image, read_image, \
+    to_float32, to_uint16, write_image
 
 DATA_DIR = os.path.abspath("./Data")
 CALIB_DATA_DIR = os.path.join(DATA_DIR, "for_calibration")
-BASE_EXPOSURE = {
-    "ISO": 100.0,
-    "shutter speed": 0.01,
-    "aperture": 3.5,
-}
-SONY_DAYLIGHT_WB = np.array([2.73851, 1.0, 1.36871])
-MY_DEFAULT_WB = np.array([2.3, 1.0, 1.7])
-# Transformation matrix from XYZ color space to linear sRGB color space under
-# D65? light
-XYZ2SRGB_MAT = np.array(
-    [[3.24045, -1.53714, -0.49853],
-     [-0.96927, 1.87601, 0.04156],
-     [0.05564, -0.20403, 1.05723]],
-    dtype=float).T
-# Transformation matrix from camera raw color space to XYZ color space
-# of sony ILCE-7RM3 camera and ricoh theta z1 camera
-SONY_CAM2XYZ_MAT = np.array(
-    [[0.66509, 0.25285, 0.03253],
-     [0.26127, 0.96595, -0.22722],
-     [0.03422, -0.20912, 1.26374]],
-    dtype=float).T
-RICOH_CAM2XYZ_MAT = np.array(
-    [[0.65183, 0.05795, 0.24069],
-     [0.20793, 0.84701, -0.05494],
-     [-0.01642, -0.59722, 1.70248]],
-    dtype=float).T
 SONY_CAM_PIXEL_W = 7952
 SONY_CAM_PIXEL_H = 5304
 SONY_CAM_SENSOR_W = 35.9  # unit: mm
 SONY_CAM_SENSOR_H = 24  # unit: mm
 EXPOSURE_INFO_FILENAME = "exposure_infos.json"
-
-
-def read_exposure_from_raw(raw_file: str) -> Dict[str, float]:
-    """Read exposure information from a raw file.
-
-    Read exposure information (ISO, shutter speed, aperture) from EXIF
-    data of a raw file, converting numbers to float.
-
-    Args:
-        raw_file (str): path to the raw image file.
-
-    Returns:
-        Dict: containing exposure information. For example:
-         {"ISO": 500.0,
-          "shutter speed": 0.01,
-          "aperture": 2.8,}
-    """
-    with open(raw_file, "rb") as f:  # pylint: disable=redefined-outer-name
-        exif = exifread.process_file(f, details=False)
-        exposure = {
-            "ISO": float(exif["EXIF ISOSpeedRatings"].values[0]),
-            "shutter speed": float(exif["EXIF ExposureTime"].values[0]),
-            "aperture": float(exif["EXIF FNumber"].values[0]),
-        }
-    return exposure
-
-
-def relative_exposure_amount(exposure: Dict[str, float]) -> float:
-    """Compute the relative exposure of an exposure setting.
-
-    Compute how many times the exposure effect of the input exposure
-    image is that of the standard exposure setting of the same camera.
-
-    Args:
-        exposure (Dict[str, float]): exposure information of the image.
-
-    Returns:
-        float: relative exposure.
-    """
-    base_exposure_amount = BASE_EXPOSURE["ISO"] * \
-                           BASE_EXPOSURE["shutter speed"] / \
-                           BASE_EXPOSURE["aperture"] ** 2
-    input_exposure_amount = exposure["ISO"] * \
-                            exposure["shutter speed"] / \
-                            exposure["aperture"] ** 2
-    return input_exposure_amount / base_exposure_amount
+WRONG_ENVMAP_FILENAME = "envmap_with_wrong_sun.hdr"
+ENVMAP_FILENAME = "envmap.hdr"
 
 
 def calibrate_ccm_ricoh2sony(sony_file: str, ricoh_file: str) \
@@ -249,28 +184,6 @@ def detect_color_checker_masks(raw_img: rawpy._rawpy.RawPy) -> np.ndarray:
     return mask
 
 
-def subtract_black_level(raw_img: rawpy._rawpy.RawPy) -> np.ndarray:
-    """Subtract black level from raw image and change value range to [0, 1].
-
-    Args:
-        raw_img (rawpy._rawpy.RawPy): raw image object.
-
-    Returns:
-        np.ndarray: image with black level subtracted and converted to [0, 1].
-
-    """
-    cfa_img = raw_img.raw_image_visible.astype(np.int32)
-    raw_colors = raw_img.raw_colors_visible
-    # intensity range transformation
-    black_level = raw_img.black_level_per_channel  # [4, ]
-    black_level = np.array(black_level, dtype=np.float32)[raw_colors]  # [h, w]
-    white_level = raw_img.white_level  # scalar
-    cfa_img = cfa_img - black_level
-    cfa_img = cfa_img.astype(np.float32) / (white_level - black_level)
-    cfa_img = np.clip(cfa_img, a_min=0, a_max=None)
-    return cfa_img
-
-
 def read_color_checker_from_raw(raw_img_file: str) -> Tuple[float, np.ndarray]:
     """ For a raw image, read the colors in the checker and relative exposure.
 
@@ -361,7 +274,7 @@ def preprocess_envmap_group(envmap_dir, ccm, over_exposure):
         # process the envmap image
         envmap_linsrgb = camera_isp(envmap_raw_file,
                                     ccm,
-                                    MY_DEFAULT_WB,
+                                    None,
                                     SONY_CAM2XYZ_MAT)
         # denoise
         envmap_linsrgb = restoration.denoise_bilateral(
@@ -370,41 +283,8 @@ def preprocess_envmap_group(envmap_dir, ccm, over_exposure):
         tifffile.imsave(envmap_tiff_file, to_uint16(envmap_linsrgb))
     exposure_infos["over_exposure_coeff"] = over_exposure
     # save exposure information
-    with open(exposure_info_file, "w", encoding="utf-8") as f: # pylint: disable=redefined-outer-name
+    with open(exposure_info_file, "w", encoding="utf-8") as f:  # pylint: disable=redefined-outer-name
         json.dump(exposure_infos, f, ensure_ascii=False, indent=4)
-
-
-def camera_isp(raw_file: str,
-               ccm: np.ndarray,
-               white_balance: np.ndarray,
-               cam2xyz_mat: np.ndarray):
-    """Apply camera ISP to a raw image and return linear sRGB image.
-
-    Args:
-        raw_file (str): the path to the raw image file.
-        ccm (np.ndarray): color correction matrix applied in raw space.
-        white_balance (np.ndarray): white balance applied in raw space.
-        cam2xyz_mat (np.ndarray): camera-specific color conversion matrix.
-
-    Returns:
-        np.ndarray: linear sRGB image after ISP.
-    """
-    raw_img = rawpy.imread(raw_file)
-    cfa_img = subtract_black_level(raw_img)
-    # demosaicing
-    demosaic_img = colour_demosaicing.demosaicing_CFA_Bayer_bilinear(
-        cfa_img, pattern="RGGB").astype(float).clip(min=0)
-    # raw space conversion
-    demosaic_img = demosaic_img @ ccm
-    # white balance and exposure
-    wb_img = demosaic_img * white_balance.reshape((1, 1, 3))
-    wb_img = np.clip(wb_img, a_min=0, a_max=1)  # over-exposed
-    # cam2xyz
-    xyz_img = wb_img @ cam2xyz_mat
-    # xyz to linear sRGB
-    linrgb_img = xyz_img @ XYZ2SRGB_MAT
-    linrgb_img = np.clip(linrgb_img, a_min=0, a_max=1)
-    return linrgb_img
 
 
 def ensure_envmaps_are_stitched(envmap_dir: str) -> bool:
@@ -441,8 +321,8 @@ def merge_ldrs_into_hdr(envmap_dir: str) -> np.ndarray:
     Returns:
         np.ndarray: the HDR panorama image.
     """
-    save_dir = os.path.join(os.path.dirname(envmap_dir), "envmap")
-    hdr_envmap_path = os.path.join(save_dir, "envmap.hdr")
+    save_dir = os.path.join(os.path.dirname(envmap_dir), "processed", "envmap")
+    hdr_envmap_path = os.path.join(save_dir, WRONG_ENVMAP_FILENAME)
     if not os.path.exists(save_dir):
         os.makedirs(save_dir)
     elif os.path.exists(hdr_envmap_path):
@@ -456,9 +336,10 @@ def merge_ldrs_into_hdr(envmap_dir: str) -> np.ndarray:
         exposure_infos = json.load(f)
 
     # height, width = 3648, 7296
-    height, width = 1024, 2048
+    height, width = 64, 128
     img_sum = np.zeros(shape=(height, width, 3), dtype=float)
     weight_sum = np.zeros(shape=(height, width, 1), dtype=float)
+    ldr_images = []
     for envmap_file in envmap_files:
         # read image and exposure info
         filename = extract_filename(envmap_file)[:-3]  # remove "_er"
@@ -467,7 +348,8 @@ def merge_ldrs_into_hdr(envmap_dir: str) -> np.ndarray:
         ldr_image = to_float32(ldr_image)
         ldr_image = cv2.resize(ldr_image, dsize=(width, height),
                                interpolation=cv2.INTER_AREA)
-        # ldr_image[-70:, :] = 0  # remove the camera pixels
+        ldr_image[-height // 12:, :] = 0  # remove the camera pixels
+        ldr_images.append((ldr_image, exposure_info))
 
         # compute weight
         brightness_image = ldr_image[..., 0] * 0.2126 + \
@@ -477,14 +359,14 @@ def merge_ldrs_into_hdr(envmap_dir: str) -> np.ndarray:
         weight_image = weight_image[:, :, None]
 
         # set the weight of pixels in extreme conditions to 0
-        if envmap_file == envmap_files[-1]:  # is the brightest image
-            weight_image[brightness_image < 0.2] = 1
-        else:
-            weight_image[brightness_image < 0.05] = 0
         if envmap_file == envmap_files[0]:  # is the darkest image
             weight_image[brightness_image > 0.7] = 1
         else:
             weight_image[brightness_image > 0.95] = 0
+        if envmap_file == envmap_files[-1]:  # is the brightest image
+            weight_image[brightness_image < 0.2] = 1
+        else:
+            weight_image[brightness_image < 0.05] = 0
 
         img_sum += ldr_image / relative_exposure_amount(exposure_info) \
                    * weight_image
@@ -498,157 +380,22 @@ def merge_ldrs_into_hdr(envmap_dir: str) -> np.ndarray:
     hdr_image = img_sum / (weight_sum + 1e-6) / \
                 exposure_infos["over_exposure_coeff"]
 
+    # correct dark pixels caused by misalignment (hacking!)
+    for pixel in np.argwhere(hdr_image[:-height // 12,].mean(axis=2) < 1e-10):
+        for ldr_image, exposure_info in ldr_images:
+            if ldr_image[pixel[0], pixel[1]].mean() > 0.5:
+                hdr_image[pixel[0], pixel[1]] = \
+                    ldr_image[pixel[0], pixel[1]] / \
+                    relative_exposure_amount(exposure_info)
+                break
+
     # save results
     write_image(hdr_envmap_path, hdr_image)
 
     return hdr_image
 
 
-def get_brightness_image(img: np.ndarray) -> np.ndarray:
-    """Get the brightness image of an image.
 
-    Args:
-        img (np.ndarray): the input image in linear sRGB space.
-
-    Returns:
-        np.ndarray: the brightness image.
-    """
-    return img[..., 0] * 0.2126 + img[..., 1] * 0.7152 + img[..., 2] * 0.0722
-
-
-class SolidAngleCalculator:
-    def __init__(self):
-        pass
-
-    def get_solid_angle(self, x, y):
-        pass
-
-
-class SolidAngleCalculatorForLimitedFOVImage(SolidAngleCalculator):
-    """Calculate solid angle for a limited FOV image."""
-    def __init__(self,
-                 pixel_w: int, pixel_h: int,
-                 sensor_w: float, sensor_h: float,
-                 focal_length: float):
-        """Initialize the solid angle calculator.
-
-        Args:
-            pixel_w (int): the height of the panorama image.
-            pixel_h (int): the width of the panorama image.
-        """
-        self.pixel_w = pixel_w
-        self.pixel_h = pixel_h
-        self.sensor_w = sensor_w
-        self.sensor_h = sensor_h
-        self.focal_length = focal_length
-
-        self.pixel_area = self.sensor_w * self.sensor_h / \
-                          (self.pixel_w * self.pixel_h)
-
-    def get_solid_angle(self, x: int, y: int) -> float:
-        """Get the solid angle of a pixel.
-
-        Args:
-            x (int): the horizontal coordinate of the pixel.
-            y (int): the vertical coordinate of the pixel.
-
-        Returns:
-            float: the solid angle of the pixel.
-        """
-        # compute the displacement of the pixel from the center of the sensor
-        x = (x + 0.5) / self.pixel_w
-        y = (y + 0.5) / self.pixel_h
-        x = x * self.sensor_w - self.sensor_w / 2
-        y = y * self.sensor_h - self.sensor_h / 2
-        # compute the distance r from the lens to the pixel.
-        d = self.focal_length
-        r = np.sqrt(x ** 2 + y ** 2 + d ** 2)
-        # Solid angle = A * cos(theta) / r ** 2,
-        # where theta is the angle between sensor normal and the ray from the
-        # lens center to the pixel center, and thus cos(theta) = d / r.
-        return self.pixel_area * d / (r ** 3)
-
-
-class SolidAngleCalculatorForPanorama(SolidAngleCalculator):
-    """Calculate solid angle for a panorama image."""
-    def __init__(self, pixel_w: int, pixel_h: int):
-        """Initialize the solid angle calculator.
-
-        Args:
-            pixel_w (int): the height of the panorama image.
-            pixel_h (int): the width of the panorama image.
-        """
-        self.pixel_w = pixel_w
-        self.pixel_h = pixel_h
-
-    def get_solid_angle(self, x: int, y: int) -> float:
-        """Get the solid angle of a pixel.
-
-        Args:
-            x (int): the horizontal coordinate of the pixel.
-            y (int): the vertical coordinate of the pixel.
-
-        Returns:
-            float: the solid angle of the pixel.
-        """
-        elevation_angle = (y + 0.5) / self.pixel_h * np.pi - np.pi / 2
-        return 2 * np.pi / self.pixel_w * \
-               np.cos(elevation_angle) * np.pi / self.pixel_h
-
-
-def compute_total_energy_and_solid_angle_above_threshold(
-        hdr_img: np.ndarray,
-        threshold: float,
-        solid_angle_calculator: SolidAngleCalculator
-) -> Tuple[np.ndarray, float, np.ndarray]:
-    brightness_img = get_brightness_image(hdr_img)
-    mask = brightness_img > threshold
-    pixels_y, pixels_x = np.where(mask)
-    total_solid_angle = 0.0
-    total_energy = np.array([0, 0, 0], float)
-    for py, px in tqdm(zip(pixels_y, pixels_x), total=len(pixels_x),
-                       desc="Processing Pixels"):
-        solid_angle = solid_angle_calculator.get_solid_angle(px, py)
-        total_solid_angle += solid_angle
-        total_energy += hdr_img[py, px, :] * solid_angle
-    return total_energy, total_solid_angle, mask
-
-
-def check_bright_part_of_hdr_image(
-        hdr_img: np.ndarray,
-        img_name: str,
-        bright_threshold: float,
-        solid_angle_calculator: SolidAngleCalculator,
-        check_full_image: bool = False,):
-    if check_full_image:
-        # print min, max and average of brightness
-        brt_img = get_brightness_image(hdr_img)
-        print(f"{img_name} brightness: "
-              f"min = {np.min(brt_img)}, "
-              f"max = {np.max(brt_img)}, "
-              f"average = {np.mean(brt_img)}")
-
-        # compute total energy and solid angle in the image
-        total_energy, total_solid_angle, _ = \
-            compute_total_energy_and_solid_angle_above_threshold(
-                hdr_img, 0, solid_angle_calculator)
-        print(f"{img_name} total energy: {total_energy}")
-        print(f"{img_name} total solid angle: {total_solid_angle}")
-        print(f"{img_name} total avg. intensity: "
-              f"{total_energy / total_solid_angle}")
-
-    # Compute total energy and solid angle in the bright part of the image
-    total_bright_energy, total_bright_solid_angle, bright_mask = \
-        compute_total_energy_and_solid_angle_above_threshold(
-            hdr_img, bright_threshold, solid_angle_calculator)
-    print(f"{img_name} bright area energy: {total_bright_energy}")
-    print(f"{img_name} bright area solid angle: {total_bright_solid_angle}")
-    print(f"{img_name} bright area avg. intensity: "
-          f"{total_bright_energy / total_bright_solid_angle}")
-    # write_image(os.path.join(save_dir, f"{img_name}_bright_mask.png"),
-    #             bright_mask)
-
-    return total_bright_energy, total_bright_solid_angle, bright_mask
 
 
 if __name__ == "__main__":
@@ -673,7 +420,7 @@ if __name__ == "__main__":
 
     # ===== Step 2: Preprocess a group of raw envmap images =====
     print("===== Step 2: Preprocess a group of raw envmap images =====")
-    group_path = os.path.abspath("./Data/0926_sun_2/")
+    group_path = r"D:\Datasets\RealDataV3\outdoor-221012-2"
     preprocess_envmap_group(os.path.join(group_path, "ricoh"),
                             ccm_ricoh2sony,
                             over_exposure_ricoh2sony)
@@ -715,13 +462,18 @@ if __name__ == "__main__":
     # Post-process the image taken with the ND filter, correcting its color
     # shift caused by the ND filter.
     print("===== Step 5: Correct the sun intensity =====")
-    sun_image_file = os.path.join(group_path, "sony", "CI_01838.ARW")
-    sun_image_save_file = os.path.join(group_path, "sony", "CI_01838.png")
+    sun_image_dir = os.path.join(group_path, "sony", "sun")
+    sun_image_file = glob.glob(os.path.join(sun_image_dir, "*.ARW"))[0]
+    sun_image_save_dir = os.path.join(group_path, "processed", "sun")
+    if not os.path.exists(sun_image_save_dir):
+        os.makedirs(sun_image_save_dir)
+    sun_image_save_file = os.path.join(
+        sun_image_save_dir, f"{extract_filename(sun_image_file)}.png")
     if not os.path.exists(sun_image_save_file):
         print(f"Processing sun image {sun_image_file}...")
         sun_image = camera_isp(sun_image_file,
                                ccm_ndfilter,
-                               MY_DEFAULT_WB,
+                               None,
                                SONY_CAM2XYZ_MAT)
         write_image(sun_image_save_file, sun_image)
     else:
@@ -776,8 +528,9 @@ if __name__ == "__main__":
                      mean_intensity.reshape(1, 1, 3) * \
                      envmap_bright_mask.reshape(
                          envmap_hdr.shape[0], envmap_hdr.shape[1], 1)
-    write_image(os.path.join(group_path, "envmap", "envmap_with_sun.hdr"),
-                             envmap_hdr_sun)
+    write_image(os.path.join(group_path, "processed", "envmap",
+                             ENVMAP_FILENAME),
+                envmap_hdr_sun)
     print("===== Step 6: Done =====\n")
 
 

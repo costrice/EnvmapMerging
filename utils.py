@@ -146,6 +146,18 @@ def extract_filename(file_path: str) -> str:
     return os.path.splitext(os.path.basename(file_path))[0]
 
 
+def get_brightness_image(img: np.ndarray) -> np.ndarray:
+    """Get the brightness image of an image.
+
+    Args:
+        img (np.ndarray): the input image in linear sRGB space.
+
+    Returns:
+        np.ndarray: the brightness image.
+    """
+    return img[..., 0] * 0.2126 + img[..., 1] * 0.7152 + img[..., 2] * 0.0722
+
+
 if __name__ == "__main__":
     save_dir = r"./"
 
